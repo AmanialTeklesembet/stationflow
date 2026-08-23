@@ -4,6 +4,8 @@ import { useMemo, useState } from "react";
 
 type ShiftStatus = "shift" | "off" | "absence" | "open";
 type TemplateKey = "1" | "2" | "5" | "7" | "11" | "N" | "F" | "U" | "V" | "L";
+type View = "leder" | "ansatt";
+type Range = "uke" | "maned";
 
 type ShiftTemplate = {
   code: TemplateKey;
@@ -35,6 +37,8 @@ type ScheduleCell = {
   code: TemplateKey;
   note?: string;
   handover?: string;
+  swapRequested?: boolean;
+  absenceRequested?: boolean;
 };
 
 const templates: Record<TemplateKey, ShiftTemplate> = {
@@ -96,7 +100,7 @@ const templates: Record<TemplateKey, ShiftTemplate> = {
   },
   U: {
     code: "U",
-    name: "Ulønnet fri",
+    name: "Syk/fravær",
     time: "Fravær",
     tone: "border-rose-200 bg-rose-50 text-rose-950",
     dot: "bg-rose-500",
@@ -170,18 +174,6 @@ const notes: Record<string, Pick<ScheduleCell, "note" | "handover">> = {
   }
 };
 
-const schedule: ScheduleCell[] = employees.flatMap((employee) =>
-  days.map((day, index) => {
-    const key = `${employee.id}-${day.key}`;
-    return {
-      employeeId: employee.id,
-      dayKey: day.key,
-      code: scheduleSeed[employee.id][index],
-      ...notes[key]
-    };
-  })
-);
-
 const checklistItems = [
   "Sjekk kaffe og bakst før rush",
   "Temperatur kjøl/frys registrert",
@@ -189,42 +181,138 @@ const checklistItems = [
   "Søppel og toalett tatt før vaktskifte"
 ];
 
-function getCell(employeeId: string, dayKey: string) {
-  return schedule.find((item) => item.employeeId === employeeId && item.dayKey === dayKey);
+function createInitialSchedule() {
+  return employees.flatMap((employee) =>
+    days.map((day, index) => {
+      const key = `${employee.id}-${day.key}`;
+      return {
+        employeeId: employee.id,
+        dayKey: day.key,
+        code: scheduleSeed[employee.id][index],
+        ...notes[key]
+      };
+    })
+  );
 }
 
 function countHours(cells: ScheduleCell[]) {
   return cells.reduce((sum, cell) => {
     const template = templates[cell.code];
-    if (template.status !== "shift") {
-      return sum;
-    }
-    if (cell.code === "2" || cell.code === "7") {
-      return sum + 5;
-    }
-    if (cell.code === "N") {
-      return sum + 8;
-    }
+    if (template.status !== "shift") return sum;
+    if (cell.code === "2" || cell.code === "7") return sum + 5;
+    if (cell.code === "N") return sum + 8;
     return sum + 7.5;
   }, 0);
 }
 
+function cellId(cell: Pick<ScheduleCell, "employeeId" | "dayKey">) {
+  return `${cell.employeeId}-${cell.dayKey}`;
+}
+
 export function StationFlowApp() {
-  const [view, setView] = useState<"leder" | "ansatt">("leder");
-  const [range, setRange] = useState<"uke" | "maned">("uke");
-  const [selected, setSelected] = useState<ScheduleCell>(() => schedule[3]);
+  const initialSchedule = useMemo(() => createInitialSchedule(), []);
+  const [view, setView] = useState<View>("leder");
+  const [range, setRange] = useState<Range>("uke");
+  const [schedule, setSchedule] = useState<ScheduleCell[]>(initialSchedule);
+  const [selectedId, setSelectedId] = useState(() => cellId(initialSchedule[3]));
+  const [message, setMessage] = useState("Velg en vakt for å se detaljer.");
+  const [clockedIn, setClockedIn] = useState(false);
+  const [completedTasks, setCompletedTasks] = useState<string[]>([]);
+  const [handoverDraft, setHandoverDraft] = useState("");
+  const [selectedEmployeeId, setSelectedEmployeeId] = useState("amanial");
+  const [selectedDayKey, setSelectedDayKey] = useState(days[0].key);
+  const [selectedCode, setSelectedCode] = useState<TemplateKey>("1");
+
   const visibleDays = range === "uke" ? days.slice(0, 7) : days;
+  const selected = schedule.find((cell) => cellId(cell) === selectedId) ?? schedule[0];
   const selectedEmployee = employees.find((employee) => employee.id === selected.employeeId)!;
   const selectedDay = days.find((day) => day.key === selected.dayKey)!;
   const selectedTemplate = templates[selected.code];
+  const nextShift = schedule.find(
+    (cell) => cell.employeeId === "amanial" && templates[cell.code].status === "shift"
+  );
 
   const myShifts = useMemo(
     () =>
       schedule
         .filter((cell) => cell.employeeId === "amanial" && templates[cell.code].status === "shift")
         .slice(0, 6),
-    []
+    [schedule]
   );
+
+  const getCell = (employeeId: string, dayKey: string) =>
+    schedule.find((item) => item.employeeId === employeeId && item.dayKey === dayKey);
+
+  const updateCell = (target: ScheduleCell, changes: Partial<ScheduleCell>) => {
+    setSchedule((current) =>
+      current.map((cell) => (cellId(cell) === cellId(target) ? { ...cell, ...changes } : cell))
+    );
+    setSelectedId(cellId(target));
+  };
+
+  const applyTemplate = (code: TemplateKey) => {
+    updateCell(selected, { code });
+    setMessage(`${selectedEmployee.name} er satt til ${templates[code].name} ${selectedDay.date}.`);
+  };
+
+  const addShift = () => {
+    const target = getCell(selectedEmployeeId, selectedDayKey);
+    if (!target) return;
+    updateCell(target, {
+      code: selectedCode,
+      note: `Lagt til av leder: ${templates[selectedCode].name}`,
+      absenceRequested: false,
+      swapRequested: false
+    });
+    setMessage(`Vakt lagt til for ${employees.find((employee) => employee.id === selectedEmployeeId)?.name}.`);
+  };
+
+  const copyFirstWeek = () => {
+    setSchedule((current) =>
+      current.map((cell) => {
+        const dayIndex = days.findIndex((day) => day.key === cell.dayKey);
+        if (dayIndex < 7) return cell;
+        const sourceDay = days[dayIndex - 7];
+        const source = current.find(
+          (item) => item.employeeId === cell.employeeId && item.dayKey === sourceDay.key
+        );
+        return source ? { ...cell, code: source.code, note: "Kopiert fra forrige uke" } : cell;
+      })
+    );
+    setRange("maned");
+    setMessage("Uke 35 er kopiert til neste uke.");
+  };
+
+  const requestSwap = (target = selected) => {
+    updateCell(target, {
+      swapRequested: true,
+      note: "Vaktbytte er sendt til leder for godkjenning."
+    });
+    setMessage("Vaktbytteforespørsel er registrert.");
+  };
+
+  const reportAbsence = () => {
+    if (!nextShift) return;
+    updateCell(nextShift, {
+      code: "U",
+      absenceRequested: true,
+      note: "Fravær meldt fra ansattvisningen."
+    });
+    setMessage("Fravær er meldt og vises i lederplanen.");
+  };
+
+  const saveHandover = () => {
+    if (!handoverDraft.trim()) return;
+    updateCell(selected, { handover: handoverDraft.trim() });
+    setHandoverDraft("");
+    setMessage("Vaktoverlevering er lagret på valgt vakt.");
+  };
+
+  const toggleTask = (item: string) => {
+    setCompletedTasks((current) =>
+      current.includes(item) ? current.filter((task) => task !== item) : [...current, item]
+    );
+  };
 
   return (
     <main className="min-h-screen px-4 py-5 text-slate-950 sm:px-6 lg:px-8">
@@ -238,35 +326,32 @@ export function StationFlowApp() {
               Shell Hønefoss vaktplan
             </h1>
             <p className="mt-1 max-w-2xl text-sm leading-6 text-slate-600">
-              Digital versjon av månedsplanen med koder, tider, fri, fravær og ledige vakter.
+              Digital vaktplan med redigering, vaktmaler, fravær, vaktbytte og oppgaver.
             </p>
           </div>
           <div className="flex flex-wrap gap-2">
-            <button
-              className={`rounded-md border px-3 py-2 text-sm font-semibold ${
-                view === "leder"
-                  ? "border-slate-950 bg-slate-950 text-white"
-                  : "border-slate-200 bg-white text-slate-700"
-              }`}
-              onClick={() => setView("leder")}
-            >
-              Leder
-            </button>
-            <button
-              className={`rounded-md border px-3 py-2 text-sm font-semibold ${
-                view === "ansatt"
-                  ? "border-slate-950 bg-slate-950 text-white"
-                  : "border-slate-200 bg-white text-slate-700"
-              }`}
-              onClick={() => setView("ansatt")}
-            >
-              Ansatt
-            </button>
+            {(["leder", "ansatt"] as View[]).map((item) => (
+              <button
+                key={item}
+                className={`rounded-md border px-3 py-2 text-sm font-semibold ${
+                  view === item
+                    ? "border-slate-950 bg-slate-950 text-white"
+                    : "border-slate-200 bg-white text-slate-700"
+                }`}
+                onClick={() => setView(item)}
+              >
+                {item === "leder" ? "Leder" : "Ansatt"}
+              </button>
+            ))}
           </div>
         </header>
 
+        <div className="rounded-lg border border-slate-200 bg-white px-4 py-3 text-sm font-semibold text-slate-700 shadow-soft">
+          {message}
+        </div>
+
         {view === "leder" ? (
-          <section className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_340px]">
+          <section className="grid gap-5 xl:grid-cols-[minmax(0,1fr)_360px]">
             <div className="min-w-0 rounded-lg border border-slate-200 bg-white shadow-soft">
               <div className="flex flex-col gap-3 border-b border-slate-200 px-4 py-4 lg:flex-row lg:items-center lg:justify-between">
                 <div>
@@ -294,11 +379,11 @@ export function StationFlowApp() {
                   >
                     Måned
                   </button>
-                  <button className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700">
+                  <button
+                    className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700"
+                    onClick={copyFirstWeek}
+                  >
                     Kopier uke
-                  </button>
-                  <button className="rounded-md bg-emerald-600 px-3 py-2 text-sm font-semibold text-white">
-                    Legg til vakt
                   </button>
                 </div>
               </div>
@@ -349,8 +434,7 @@ export function StationFlowApp() {
                           {visibleDays.map((day) => {
                             const cell = getCell(employee.id, day.key)!;
                             const template = templates[cell.code];
-                            const isSelected =
-                              selected.employeeId === cell.employeeId && selected.dayKey === cell.dayKey;
+                            const isSelected = selectedId === cellId(cell);
                             return (
                               <td
                                 key={day.key}
@@ -359,10 +443,10 @@ export function StationFlowApp() {
                                 }`}
                               >
                                 <button
-                                  className={`min-h-20 w-full rounded-md border p-2 text-left transition hover:-translate-y-0.5 hover:shadow-md ${
+                                  className={`min-h-24 w-full rounded-md border p-2 text-left transition hover:-translate-y-0.5 hover:shadow-md ${
                                     template.tone
                                   } ${isSelected ? "ring-2 ring-slate-900" : ""}`}
-                                  onClick={() => setSelected(cell)}
+                                  onClick={() => setSelectedId(cellId(cell))}
                                 >
                                   <div className="flex items-center justify-between gap-2">
                                     <span className="rounded bg-white/70 px-1.5 py-0.5 text-xs font-black">
@@ -372,6 +456,11 @@ export function StationFlowApp() {
                                   </div>
                                   <div className="mt-2 text-sm font-bold">{template.time}</div>
                                   <div className="mt-1 text-xs font-medium opacity-80">{template.name}</div>
+                                  {(cell.swapRequested || cell.absenceRequested) && (
+                                    <div className="mt-2 rounded bg-white/80 px-1.5 py-1 text-[11px] font-bold">
+                                      {cell.swapRequested ? "Bytte sendt" : "Fravær meldt"}
+                                    </div>
+                                  )}
                                 </button>
                               </td>
                             );
@@ -393,7 +482,7 @@ export function StationFlowApp() {
                   <div>
                     <h2 className="text-lg font-bold">Valgt vakt</h2>
                     <p className="text-sm text-slate-600">
-                      {selectedDay.weekday} {selectedDay.date}
+                      {selectedEmployee.name}, {selectedDay.weekday} {selectedDay.date}
                     </p>
                   </div>
                   <span className={`rounded-md border px-2 py-1 text-sm font-black ${selectedTemplate.tone}`}>
@@ -401,27 +490,90 @@ export function StationFlowApp() {
                   </span>
                 </div>
                 <div className="mt-4 rounded-lg border border-slate-200 bg-slate-50 p-3">
-                  <div className="text-sm text-slate-500">Ansatt</div>
-                  <div className="font-bold">{selectedEmployee.name}</div>
-                  <div className="mt-3 text-sm text-slate-500">Tid</div>
+                  <div className="text-sm text-slate-500">Tid</div>
                   <div className="font-bold">{selectedTemplate.time}</div>
                   <div className="mt-3 text-sm text-slate-500">Type</div>
                   <div className="font-bold">{selectedTemplate.name}</div>
+                  <div className="mt-3 text-sm text-slate-500">Notat</div>
+                  <div className="text-sm font-semibold">{selected.note ?? "Ingen notat"}</div>
                 </div>
-                <div className="mt-4 space-y-3">
-                  <button className="w-full rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-white">
-                    Rediger vakt
+                <div className="mt-4 grid grid-cols-2 gap-2">
+                  <button
+                    className="rounded-md bg-slate-950 px-3 py-2 text-sm font-semibold text-white"
+                    onClick={() => applyTemplate(selected.code === "F" ? "1" : "F")}
+                  >
+                    Fri / på jobb
                   </button>
-                  <button className="w-full rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700">
-                    Send bytteforespørsel
+                  <button
+                    className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700"
+                    onClick={() => requestSwap()}
+                  >
+                    Vaktbytte
                   </button>
                 </div>
-                {(selected.note || selected.handover) && (
+                <textarea
+                  className="mt-4 min-h-24 w-full rounded-md border border-slate-200 p-3 text-sm outline-none focus:border-slate-500"
+                  placeholder="Skriv vaktoverlevering..."
+                  value={handoverDraft}
+                  onChange={(event) => setHandoverDraft(event.target.value)}
+                />
+                <button
+                  className="mt-2 w-full rounded-md bg-emerald-600 px-3 py-2 text-sm font-semibold text-white"
+                  onClick={saveHandover}
+                >
+                  Lagre vaktoverlevering
+                </button>
+                {(selected.handover || selected.note) && (
                   <div className="mt-4 rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-950">
                     <div className="font-bold">Vaktoverlevering</div>
                     <p className="mt-1 leading-5">{selected.handover ?? selected.note}</p>
                   </div>
                 )}
+              </section>
+
+              <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-soft">
+                <h2 className="text-lg font-bold">Legg til / endre vakt</h2>
+                <div className="mt-3 grid gap-2">
+                  <select
+                    className="rounded-md border border-slate-200 px-3 py-2 text-sm"
+                    value={selectedEmployeeId}
+                    onChange={(event) => setSelectedEmployeeId(event.target.value)}
+                  >
+                    {employees.map((employee) => (
+                      <option key={employee.id} value={employee.id}>
+                        {employee.name}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="rounded-md border border-slate-200 px-3 py-2 text-sm"
+                    value={selectedDayKey}
+                    onChange={(event) => setSelectedDayKey(event.target.value)}
+                  >
+                    {days.map((day) => (
+                      <option key={day.key} value={day.key}>
+                        {day.weekday} {day.date}
+                      </option>
+                    ))}
+                  </select>
+                  <select
+                    className="rounded-md border border-slate-200 px-3 py-2 text-sm"
+                    value={selectedCode}
+                    onChange={(event) => setSelectedCode(event.target.value as TemplateKey)}
+                  >
+                    {Object.values(templates).map((template) => (
+                      <option key={template.code} value={template.code}>
+                        {template.code} - {template.name} ({template.time})
+                      </option>
+                    ))}
+                  </select>
+                  <button
+                    className="rounded-md bg-emerald-600 px-3 py-2 text-sm font-semibold text-white"
+                    onClick={addShift}
+                  >
+                    Lagre vakt
+                  </button>
+                </div>
               </section>
 
               <section className="rounded-lg border border-slate-200 bg-white p-4 shadow-soft">
@@ -431,7 +583,7 @@ export function StationFlowApp() {
                     <button
                       key={template.code}
                       className={`rounded-md border p-2 text-left ${template.tone}`}
-                      onClick={() => setSelected({ ...selected, code: template.code })}
+                      onClick={() => applyTemplate(template.code)}
                     >
                       <div className="text-xs font-black">{template.code}</div>
                       <div className="text-sm font-bold">{template.name}</div>
@@ -454,16 +606,34 @@ export function StationFlowApp() {
                   <p className="text-sm text-slate-600">Skiftleder</p>
                 </div>
               </div>
-              <div className="mt-5 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
-                <div className="text-sm font-semibold text-emerald-800">Neste vakt</div>
-                <div className="mt-1 text-2xl font-black text-emerald-950">Man 24. aug</div>
-                <div className="mt-1 font-bold text-emerald-950">05:45-13:00</div>
-              </div>
+              {nextShift && (
+                <div className="mt-5 rounded-lg border border-emerald-200 bg-emerald-50 p-4">
+                  <div className="text-sm font-semibold text-emerald-800">Neste vakt</div>
+                  <div className="mt-1 text-2xl font-black text-emerald-950">
+                    {days.find((day) => day.key === nextShift.dayKey)?.weekday}{" "}
+                    {days.find((day) => day.key === nextShift.dayKey)?.date}
+                  </div>
+                  <div className="mt-1 font-bold text-emerald-950">
+                    {templates[nextShift.code].time}
+                  </div>
+                </div>
+              )}
               <div className="mt-4 grid grid-cols-2 gap-2">
-                <button className="rounded-md bg-slate-950 px-3 py-3 text-sm font-semibold text-white">
-                  Stemple inn
+                <button
+                  className={`rounded-md px-3 py-3 text-sm font-semibold text-white ${
+                    clockedIn ? "bg-rose-600" : "bg-slate-950"
+                  }`}
+                  onClick={() => {
+                    setClockedIn((current) => !current);
+                    setMessage(clockedIn ? "Du er stemplet ut." : "Du er stemplet inn.");
+                  }}
+                >
+                  {clockedIn ? "Stemple ut" : "Stemple inn"}
                 </button>
-                <button className="rounded-md border border-slate-200 bg-white px-3 py-3 text-sm font-semibold text-slate-700">
+                <button
+                  className="rounded-md border border-slate-200 bg-white px-3 py-3 text-sm font-semibold text-slate-700"
+                  onClick={reportAbsence}
+                >
                   Meld fravær
                 </button>
               </div>
@@ -475,7 +645,10 @@ export function StationFlowApp() {
                   <h2 className="text-lg font-bold">Mine vakter</h2>
                   <p className="text-sm text-slate-600">Kommende vakter og oppgaver</p>
                 </div>
-                <button className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700">
+                <button
+                  className="rounded-md border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-700"
+                  onClick={() => nextShift && requestSwap(nextShift)}
+                >
                   Be om vaktbytte
                 </button>
               </div>
@@ -485,10 +658,10 @@ export function StationFlowApp() {
                   const template = templates[cell.code];
                   return (
                     <button
-                      key={`${cell.employeeId}-${cell.dayKey}`}
+                      key={cellId(cell)}
                       className={`rounded-lg border p-4 text-left ${template.tone}`}
                       onClick={() => {
-                        setSelected(cell);
+                        setSelectedId(cellId(cell));
                         setView("leder");
                       }}
                     >
@@ -502,6 +675,9 @@ export function StationFlowApp() {
                       </div>
                       <div className="mt-3 text-xl font-black">{template.time}</div>
                       <div className="mt-1 text-sm font-semibold">{template.name}</div>
+                      {cell.swapRequested && (
+                        <div className="mt-2 text-xs font-bold">Vaktbytte sendt</div>
+                      )}
                     </button>
                   );
                 })}
@@ -514,10 +690,20 @@ export function StationFlowApp() {
                       key={item}
                       className="flex items-center gap-3 rounded-md border border-slate-200 bg-white p-3 text-sm font-medium"
                     >
-                      <input className="h-4 w-4 accent-emerald-600" type="checkbox" />
-                      {item}
+                      <input
+                        checked={completedTasks.includes(item)}
+                        className="h-4 w-4 accent-emerald-600"
+                        type="checkbox"
+                        onChange={() => toggleTask(item)}
+                      />
+                      <span className={completedTasks.includes(item) ? "line-through opacity-60" : ""}>
+                        {item}
+                      </span>
                     </label>
                   ))}
+                </div>
+                <div className="mt-3 text-sm font-semibold text-slate-600">
+                  {completedTasks.length} av {checklistItems.length} oppgaver fullført
                 </div>
               </div>
             </div>
